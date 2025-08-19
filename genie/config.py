@@ -1,55 +1,84 @@
+# ===== FILE: config.py =====
 import json
 from dataclasses import dataclass
+from typing import Optional
 
 from genie.factorization_utils import nth_root
 
 
 @dataclass
 class GenieConfig:
+    # --- Model core ---
     num_layers: int
     num_heads: int
     d_model: int
-    T: int = 16  # temporal sequence length
-    S: int = 256  # spatial sequence length, e.g. 256 for 16x16
-    image_vocab_size: int = 262144  # image_vocab_size: number of distinct image tokens;
-    # actual model vocab size is larger to include special (e.g. mask) tokens.
+
+    # --- Sequence shape (v2.0) ---
+    # T = 6 (past3 + future3), S = 32*32 (latent 32×32)
+    T: int = 6
+    S: int = 32 * 32
+
+    # --- Vocabulary (Cosmos DV 8×8×8) ---
+    #  image_vocab_size = 64_000 = 40^3
+    image_vocab_size: int = 64_000
+    num_factored_vocabs: int = 3
+    factored_vocab_size: Optional[int] = 40  # 40 × 3 vocabs → output channels 120
+
+    # Special/mask tokens (MaskGIT-style); by 규약 mask_token_id == image_vocab_size
+    mask_token_id: Optional[int] = None
+
+    # muP / Attention / MLP
     use_mup: bool = False
-
-    # Factorization for large vocabs (e.g. Open-MAGVIT2)
-    num_factored_vocabs: int = 1
-    factored_vocab_size: int = None
-
-    # MaskGIT training (all arbitrary numbers)
-    max_corrupt_rate: float = 0.2  # Corrupt all tokens, uniform between [0, max_corrupt_rate]
-    # Case 1: MLM training.
-    # Case 2: Not standard MLM, `non_mlm`. Some earlier frames are left unmasked, as in Copilot4D.
-    non_mlm_ratio: float = 0.5
-    num_prompt_frames: int = 8
-
-    # Attention
     qkv_bias: bool = False
     proj_bias: bool = True
     attn_drop: float = 0.0
     qk_norm: bool = True
-
-    # MLP
     mlp_ratio: float = 4.0
     mlp_drop: float = 0.0
     mlp_bias: bool = True
 
-    def save_pretrained(self, json_path):
+    # --- (Legacy collator용 하이퍼; v2.0 데이터 경로에서는 보통 미사용이지만 남겨둠) ---
+    # 비활성 또는 최소 사용이 권장됨.
+    max_corrupt_rate: float = 0.0       # v2.0에서는 데이터셋에서 이미 마스크 구성
+    non_mlm_ratio: float = 0.0          # v2.0에서는 teacher-forced time만 사용
+    num_prompt_frames: int = 3          # past3
+
+    # --- Prefix conditioning (v2.0 기본 On) ---
+    use_prefix_condition: bool = True
+    num_prefix: int = 8
+    cond_drop_p: float = 0.1
+    future_start: int = 3               # t >= 3 (미래 구간)에만 prefix 활성
+
+    # ---------- I/O ----------
+    def save_pretrained(self, json_path: str):
         with open(json_path, "w") as f:
             json.dump(vars(self), f)
 
     @classmethod
-    def from_pretrained(cls, json_path):
+    def from_pretrained(cls, json_path: str):
         with open(json_path, "r") as f:
-            config = json.load(f)
-
-        return cls(**config)
+            cfg = json.load(f)
+        return cls(**cfg)
 
     def shallow_copy(self):
         return GenieConfig(**vars(self))
 
+    # ---------- Post init checks / derived ----------
     def __post_init__(self):
-        self.factored_vocab_size = nth_root(self.image_vocab_size, self.num_factored_vocabs)
+        # factored_vocab_size 유도/검증
+        if self.factored_vocab_size is None:
+            # image_vocab_size = (factored_vocab_size)^(num_factored_vocabs)
+            self.factored_vocab_size = nth_root(self.image_vocab_size, self.num_factored_vocabs)
+        else:
+            # 주어진 조합이 일관적인지 확인 (Cosmos: 64_000 == 40^3)
+            assert self.image_vocab_size == self.factored_vocab_size ** self.num_factored_vocabs, \
+                f"image_vocab_size({self.image_vocab_size}) != " \
+                f"{self.factored_vocab_size}^{self.num_factored_vocabs}"
+
+        # v2.0 규약: 출력 채널 = factored_vocab_size * num_factored_vocabs = 120
+        assert self.factored_vocab_size * self.num_factored_vocabs == 120, \
+            f"Expected 120 output channels, got {self.factored_vocab_size * self.num_factored_vocabs}"
+
+        # Mask token id = image_vocab_size
+        if self.mask_token_id is None:
+            self.mask_token_id = self.image_vocab_size
