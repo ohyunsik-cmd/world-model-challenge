@@ -1,207 +1,196 @@
-"""
-Example usage:
-`python genie/evaluate.py --checkpoint_dir 1x-technologies/GENIE_35M`
-"""
-
+# ===== FILE: evaluate.py =====
 import argparse
-import time
 import os
 import sys
-from collections import defaultdict
 from pathlib import Path
+from typing import Optional
 
-import lpips
 import torch
-import transformers
-from einops import rearrange
 from torch.utils.data import DataLoader
+from einops import rearrange
 from tqdm import tqdm
-from transformers import default_data_collator
 
-
-# 1xgpt imports
+# 로컬 모듈
 sys.path.append(os.getcwd())
-from data import RawTokenDataset
-from visualize import decode_latents_wrapper
-from eval_utils import decode_tokens, compute_lpips, AvgMetric, compute_loss
+from eval_utils import (
+    compute_loss_future_only_v2,
+    compute_acc_future_only_v2,
+)
 from genie.st_mask_git import STMaskGIT
 
 
-# Hardcoded values for the v1.1 dataset
-WINDOW_SIZE = 16
-STRIDE = 15  # Data is 30 Hz so with stride 15, video is 2 Hz
-
-
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate GENIE-style models.")
-    parser.add_argument(
-        "--val_data_dir", type=str, default="data/val_v1.1",
-        help="A directory with video data, should have a `metadata.json` and `video.bin`."
-    )
-    parser.add_argument(
-        "--checkpoint_dir", type=str,
-        help="Path to a HuggingFace-style checkpoint."
-    )
-    parser.add_argument(
-        "--batch_size", type=int, default=16,
-        help="Batch size, current script only supports a single GPU."
-    )
-    parser.add_argument(
-        "--maskgit_steps", type=int, default=2, help="Number of MaskGIT sampling steps."
-    )
-    parser.add_argument(
-        "--temperature", type=float, default=0,
-        help="Sampling temperature. If `temperature` <= 1e-8, will do greedy sampling."
-    )
-    parser.add_argument(
-        "--save_outputs_dir", type=str,
-        help="Debug option. If specified, will save model predictions and ground truths to this directory. "
-             "Specifically, will save `{pred_frames,pred_logits,gtruth_frames,gtruth_tokens}.pt`"
-    )
-    parser.add_argument(
-        "--max_examples", type=int,
-        help="If specified, will stop evaluation early after `max_examples` examples."
-    )
+    p = argparse.ArgumentParser(description="Evaluate GENIE (v2.0, future-only CE/Acc).")
 
-    return parser.parse_args()
+    # 데이터 경로 / 로더
+    p.add_argument("--val_data_dir", type=str, required=True,
+                   help="샤드/메타가 들어있는 v2.0 검증 폴더 (예: data/val_v2.0)")
+    p.add_argument("--rank", type=int, default=0, help="읽을 샤드 rank")
+    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--pin_memory", action="store_true")
+
+    # 모델 & 평가
+    p.add_argument("--checkpoint_dir", type=str, required=True,
+                   help="HuggingFace-style 체크포인트 경로")
+    p.add_argument("--max_batches", type=int, default=None,
+                   help="디버그용: 지정 시 해당 배치 수까지만 평가")
+
+    # v2.0 고정 하이퍼파라미터(필요시 덮어쓸 수 있게 인자화)
+    p.add_argument("--T_total", type=int, default=6)          # past3 + future3
+    p.add_argument("--future_start", type=int, default=3)     # 미래 시작 인덱스
+    p.add_argument("--factored_vocab_size", type=int, default=40)  # V
+    p.add_argument("--num_factored_vocabs", type=int, default=3)    # F
+    p.add_argument("--H", type=int, default=32)
+    p.add_argument("--W", type=int, default=32)
+    p.add_argument("--ignore_index", type=int, default=-100)
+
+    return p.parse_args()
 
 
-class GenieEvaluator:
-    def __init__(self, args, decode_latents, device="cuda"):
-        super().__init__()
-
-        self.model = STMaskGIT.from_pretrained(args.checkpoint_dir)
-
-        self.model = self.model.to(device=device)
-        self.model.eval()
-
-        self.decode_latents = decode_latents
-        self.device = device
-        self.args = args
-
-    def predict_zframe_logits(self, input_ids: torch.LongTensor) -> tuple[torch.LongTensor, torch.FloatTensor]:
-        """
-        Conditioned on each prefix: [frame_0], [frame_0, frame_1], ..., [frame_0, frame_1, ... frame_{T-1}],
-        predict the tokens in the following frame: [pred_frame_1, pred_frame_2, ..., pred_frame_T].
-
-        Image logits are denoised in parallel across spatial dimension and teacher-forced
-        across the time dimension. To compute logits, we save both the samples and logits as we do MaskGIT generation.
-
-        Total number of forward passes is (T-1) * maskgit steps.
-
-        Args:
-            input_ids: LongTensor of size (B, T*H*W) corresponding to flattened, tokenized images.
-
-        Returns: (samples_THW, factored_logits)
-            samples_THW:
-                size (B, T, H, W) corresponding to the token ids of the predicted frames.
-                May differ from the argmax of `factored_logits` if not greedy sampling.
-            factored_logits:
-                size (B, 512, 2, T-1, H, W) corresponding to the predicted logits.
-                Note that we are factorizing the 2**18 vocabulary into two separate vocabularies of size 512 each.
-        """
-        inputs_THW = rearrange(input_ids, "b (t h w) -> b t h w", t=WINDOW_SIZE,
-                               h=self.args.latent_h, w=self.args.latent_w).to(self.device)
-        all_samples = []
-        all_logits = []
-        for timestep in range(1, WINDOW_SIZE):
-            print(f"Generating frame {timestep}")
-            inputs_masked = inputs_THW.clone()
-            inputs_masked[:, timestep:] = self.model.mask_token_id
-
-            # MaskGIT sampling
-            samples_HW, factored_logits = self.model.maskgit_generate(
-                inputs_masked, out_t=timestep, maskgit_steps=self.args.maskgit_steps,
-                temperature=self.args.temperature,
-            )
-
-            all_samples.append(samples_HW)
-            all_logits.append(factored_logits)
-
-        samples_THW = torch.stack(all_samples, dim=1)
-        return samples_THW, torch.stack(all_logits, dim=3)
-
-    def predict_next_frames(self, samples_THW) -> torch.Tensor:
-        """
-        All model submissions should have this defined.
-
-        Like predict_next_frames, this is teacher-forced along time dimension, autoregressive along spatial dimension.
-
-        Conditioned on each prefix: [frame_0], [frame_0, frame_1], ..., [frame_0, frame_1, ..., frame_{T-1}],
-        predict the following frame: [pred_frame_1, pred_frame_2, ..., pred_frame_T].
-
-        For this model, the frames are generated by using the argmax of `predict_zframe_logits`
-        and decoding the quantized latent space tokens back to the original image space.
-
-        Args:
-            samples_THW: LongTensor of size (B, T, H, W) corresponding to sampled images in the quantized latent space.
-
-        Returns:
-            LongTensor of size (B, T-1, 3, 256, 256) corresponding to the predicted frames.
-        """
-        return decode_tokens(samples_THW.cpu(), self.decode_latents)
+def _load_dataset(val_dir: str, rank: int):
+    """
+    CosmosVideoDataset가 있으면 사용하고, 없으면 RawTokenDataset로 폴백.
+    CosmosVideoDataset:
+      __getitem__가 dict 반환:
+        - input_ids: [6*H*W], labels: [6*H*W], states_future: [17,25] (옵션)
+    RawTokenDataset (v1 포맷)일 경우에는 window_size/stride 등을 강제 지정해야 하는데,
+    v2.0 용 평가에서는 Cosmos 사용을 권장.
+    """
+    # 1) Cosmos 우선
+    try:
+        from data import CosmosVideoDataset
+        ds = CosmosVideoDataset(root=val_dir, rank=rank)
+        use_cosmos = True
+        return ds, use_cosmos
+    except Exception:
+        # 2) 폴백: RawTokenDataset (가능하면 window_size=6로)
+        from data import RawTokenDataset
+        # RawTokenDataset은 window_size/stride 가 필요. v2.0에 맞추어 window_size=6.
+        ds = RawTokenDataset(val_dir, window_size=6, stride=1, filter_overlaps=True)
+        use_cosmos = False
+        return ds, use_cosmos
 
 
 @torch.no_grad()
 def main():
-    transformers.set_seed(42)
     args = parse_args()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    val_dataset = RawTokenDataset(args.val_data_dir, window_size=WINDOW_SIZE, stride=STRIDE, filter_overlaps=True)
-    args.latent_h = args.latent_w = val_dataset.metadata["s"]
+    # 데이터셋
+    val_dataset, use_cosmos = _load_dataset(args.val_data_dir, args.rank)
 
-    decode_latents = decode_latents_wrapper()
-    lpips_alex = lpips.LPIPS(net="alex")  # Calculate LPIPS w/ AlexNet, which is the fastest model out of their options
+    def _collate(batch):
+        # Cosmos/RawTokenDataset 둘 다 dict를 반환한다고 가정하고, 기본 스택
+        out = {}
+        keys = batch[0].keys()
+        for k in keys:
+            if batch[0][k] is None:
+                out[k] = None
+            else:
+                out[k] = torch.stack([torch.as_tensor(ex[k]) for ex in batch])
+        return out
 
-    if args.max_examples is not None:
-        val_dataset.valid_start_inds = val_dataset.valid_start_inds[:args.max_examples]
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+        collate_fn=_collate,
+    )
 
-    dataloader = DataLoader(val_dataset, collate_fn=default_data_collator, batch_size=args.batch_size)
+    # 모델 로드
+    model = STMaskGIT.from_pretrained(args.checkpoint_dir).to(device)
+    model.eval()
 
-    evaluator = GenieEvaluator(args, decode_latents)
-    metrics = defaultdict(AvgMetric)
+    T = args.T_total
+    H = args.H
+    W = args.W
+    V = args.factored_vocab_size
+    F = args.num_factored_vocabs
+    Tf = T - args.future_start  # 3
 
-    if args.save_outputs_dir is not None:
-        outputs_to_save = defaultdict(list)
+    # 집계 메트릭
+    total_loss = 0.0
+    total_acc = 0.0
+    total_frames = 0  # 배치 샘플 수 기준이 아니라, 배치 내 유효 프레임 수(미래3*B)로 스케일링해도 되고,
+                      # 여기선 단순히 샘플 수(=배치 수) 평균으로 처리.
 
-    for batch in tqdm(dataloader):
-        batch_size = batch["input_ids"].size(0)
-        reshaped_input_ids = rearrange(batch["input_ids"], "b (t h w) -> b t h w", t=WINDOW_SIZE,
-                                       h=args.latent_h, w=args.latent_w)
+    # 평가 루프
+    for bi, batch in enumerate(tqdm(val_loader, desc="Evaluating")):
+        input_ids = batch["input_ids"].to(device)      # [B, T*H*W]
+        labels = batch["labels"].to(device)            # [B, T*H*W] (과거는 IGNORE일 수 있음)
+        states_future = batch.get("states_future", None)
+        if states_future is not None:
+            states_future = states_future.to(device)   # [B,17,25] 예상
 
-        start_time = time.time()
-        samples, factored_logits = evaluator.predict_zframe_logits(batch["input_ids"])
-        frames_per_batch = (WINDOW_SIZE - 1) * batch["input_ids"].size(0)
-        metrics["gen_time"].update((time.time() - start_time) / frames_per_batch, batch_size)
+        B = input_ids.size(0)
 
-        loss = compute_loss(batch["labels"], factored_logits)
+        # [B, T, H, W]로 변환
+        x_THW = rearrange(input_ids, "B (T H W) -> B T H W", T=T, H=H, W=W)
 
-        acc = (reshaped_input_ids[:, 1:].to("cuda") == samples).float().mean().item()
+        # 모델 로짓 계산: [B, C=V*F, T, H, W]
+        logits_CTHW = model.compute_logits(x_THW)
 
-        metrics["loss"].update(loss, batch_size)
-        metrics["acc"].update(acc, batch_size)
+        # 미래 3프레임 로짓만 선택 후, [B, V, F, Tf, H, W]로 재배열
+        logits_future = logits_CTHW[:, :, args.future_start:]  # [B, C, Tf, H, W]
+        factored_logits = rearrange(
+            logits_future,
+            "b (num_vocabs vocab_size) t h w -> b vocab_size num_vocabs t h w",
+            vocab_size=V,
+            num_vocabs=F,
+        )  # [B, V, F, Tf, H, W] (Tf==3)
 
-        start_time = time.time()
-        pred_frames = evaluator.predict_next_frames(samples)
-        metrics["dec_time"].update((time.time() - start_time) / frames_per_batch, batch_size)
+        # 손실 (미래 프레임만 CE)
+        loss = compute_loss_future_only_v2(
+            labels=labels,
+            factored_logits=factored_logits,
+            T_total=T,
+            future_start=args.future_start,
+            num_factored_vocabs=F,
+            factored_vocab_size=V,
+            H=H,
+            W=W,
+            ignore_index=args.ignore_index,
+            reduction="mean",
+        )
 
-        decoded_gtruth = decode_tokens(reshaped_input_ids, decode_latents)
-        metrics["pred_lpips"].update_list(compute_lpips(decoded_gtruth[:, 1:], pred_frames, lpips_alex))
-        
-        print({key: f"{val.mean():.4f}" for key, val in metrics.items()})
-        if args.save_outputs_dir is not None:
-            outputs_to_save["pred_frames"].append(pred_frames)
-            outputs_to_save["pred_logits"].append(factored_logits)
-            outputs_to_save["gtruth_frames"].append(decoded_gtruth)
-            outputs_to_save["gtruth_tokens"].append(reshaped_input_ids)
+        # 정확도 (미래 프레임만)
+        #   per-factor argmax -> [B, F, Tf, H, W] -> (F 축을 팩토리 합성해) [B, Tf, H, W]
+        preds_factor = factored_logits.argmax(dim=1)  # [B, F, Tf, H, W]
+        preds_THWF = rearrange(preds_factor, "b f t h w -> b t h w f")
+        # unfactorize
+        from genie.factorization_utils import unfactorize_token_ids
+        preds_future_THW = unfactorize_token_ids(
+            preds_THWF, num_factored_vocabs=F, factored_vocab_size=V
+        )  # [B, Tf, H, W]
 
-    if args.save_outputs_dir is not None:
-        os.makedirs(args.save_outputs_dir, exist_ok=True)
-        save_outputs_dir = Path(args.save_outputs_dir)
-        torch.save(torch.cat(outputs_to_save["pred_frames"], dim=0).cpu(), save_outputs_dir / "pred_frames.pt")
-        torch.save(torch.cat(outputs_to_save["pred_logits"], dim=0).cpu(), save_outputs_dir / "pred_logits.pt")
-        torch.save(torch.cat(outputs_to_save["gtruth_frames"], dim=0).cpu(), save_outputs_dir / "gtruth_frames.pt")
-        torch.save(torch.cat(outputs_to_save["gtruth_tokens"], dim=0).cpu(), save_outputs_dir / "gtruth_tokens.pt")
+        # 라벨/샘플 전체 T축 텐서로 맞추기 위해 과거 3프레임은 dummy로 채워 concat
+        pad = torch.full((B, args.future_start, H, W), fill_value=args.ignore_index, device=preds_future_THW.device)
+        preds_THW = torch.cat([pad, preds_future_THW], dim=1)  # [B, T, H, W]
+        acc = compute_acc_future_only_v2(
+            samples=preds_THW,
+            labels=rearrange(labels, "b (t h w) -> b t h w", t=T, h=H, w=W),
+            T_total=T,
+            future_start=args.future_start,
+            H=H,
+            W=W,
+            ignore_index=args.ignore_index,
+        )
+
+        total_loss += float(loss)
+        total_acc += float(acc)
+        total_frames += 1
+
+        if args.max_batches is not None and (bi + 1) >= args.max_batches:
+            break
+
+    mean_loss = total_loss / max(total_frames, 1)
+    mean_acc = total_acc / max(total_frames, 1)
+
+    print(f"[Eval v2.0] loss_future3_ce: {mean_loss:.6f}  acc_future3: {mean_acc:.4f}")
+    # 필요시 WandB로도 기록하려면 여기서 wandb.init / wandb.log 호출 추가하면 됨.
 
 
 if __name__ == "__main__":
