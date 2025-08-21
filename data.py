@@ -9,6 +9,9 @@ from typing import Dict, Any, Optional, List
 import numpy as np
 import torch
 from torch.utils.data import Dataset as TorchDataset
+import glob, json
+from pathlib import Path
+from torch.utils.data import ConcatDataset
 
 
 # ------------------------------
@@ -90,6 +93,27 @@ IMAGE_VOCAB_SIZE = 64000
 DEFAULT_MASK_TOKEN_ID = IMAGE_VOCAB_SIZE
 DEFAULT_IGNORE_INDEX = -100
 
+def list_available_shards(root: str) -> list[int]:
+    """data/<split>/metadata/metadata_*.json 검사해서 사용 가능한 shard index들을 반환."""
+    meta_dir = Path(root) / "metadata"
+    if meta_dir.exists():
+        files = sorted(glob.glob(str(meta_dir / "metadata_*.json")))
+        ranks = []
+        for f in files:
+            # .../metadata_12.json -> 12
+            stem = Path(f).stem
+            ind = int(stem.split("_")[-1])
+            ranks.append(ind)
+        return ranks
+    # fallback: metadata.json에 num_shards 있으면 0..num_shards-1 반환
+    mj = json.load(open(Path(root) / "metadata.json"))
+    num = int(mj.get("num_shards", 1))
+    return list(range(num))
+
+def build_concat_cosmos(root: str, ranks: list[int]) -> ConcatDataset:
+    """여러 shards를 하나로 합친 ConcatDataset."""
+    parts = [CosmosVideoDataset(root, rank=r) for r in ranks]
+    return ConcatDataset(parts)
 
 def _first_existing(root: Path, candidates: List[str]) -> Optional[Path]:
     """Return the first existing path under root for the given relative paths."""
