@@ -92,7 +92,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         self.out_x_proj = Readout(config.d_model, config.factored_vocab_size * config.num_factored_vocabs)
 
         # -------- 상태 프리픽스 어댑터    --------
-        self.use_prefix = bool(getattr(config, "use_prefix_condition", False))
+        self.use_prefix = bool(getattr(config, "use_prefix_condition", True))
         if self.use_prefix:
             d_s = getattr(config, "d_s", 138)  # 기본 138 (sin/cos 126 + gripper 6 + vel 6)
             num_prefix = getattr(config, "num_prefix", 8)
