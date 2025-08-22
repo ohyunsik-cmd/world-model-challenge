@@ -47,7 +47,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
 
     - 입력 토큰: [B,T,H,W] (unfactorized)
     - 출력 로짓: [B, C=V*num_vocabs, T, H, W]
-    - (옵션) 상태 프리픽스: 각 시간 t별로 N개의 prefix 토큰을 S축 앞에 주입 후, 디코더 출력에서 prefix 채널 제거
+    - 상태 프리픽스: 각 시간 t별로 N개의 prefix 토큰을 S축 앞에 주입 후, 디코더 출력에서 prefix 채널 제거
     """
 
     def __init__(self, config: GenieConfig):
@@ -91,7 +91,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         Readout = FixedMuReadout if config.use_mup else nn.Linear
         self.out_x_proj = Readout(config.d_model, config.factored_vocab_size * config.num_factored_vocabs)
 
-        # -------- 상태 프리픽스 어댑터 (옵션) --------
+        # -------- 상태 프리픽스 어댑터    --------
         self.use_prefix = bool(getattr(config, "use_prefix_condition", False))
         if self.use_prefix:
             d_s = getattr(config, "d_s", 138)  # 기본 138 (sin/cos 126 + gripper 6 + vel 6)
@@ -178,7 +178,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         maskgit_steps: int = 1,
         temperature: float = 0.0,
         unmask_mode: str = "random",
-        states_future: Optional[torch.Tensor] = None,  # (옵션) prefix용
+        states_future: Optional[torch.Tensor] = None,  # prefix용
     ) -> Tuple[torch.LongTensor, torch.FloatTensor]:
         """
         MaskGIT-style inference to predict frame `out_t`.
